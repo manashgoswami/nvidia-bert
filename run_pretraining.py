@@ -59,6 +59,10 @@ torch._C._jit_set_profiling_executor(False)
 
 skipped_steps = 0
 
+# --- ort training edit
+import ort.ort_supplement as ort_supplement
+# ---
+
 #Workaround because python functions are not picklable
 class WorkerInitObj(object):
     def __init__(self, seed):
@@ -255,6 +259,12 @@ def parse_arguments():
                         default=False,
                         action='store_true',
                         help='Disable tqdm progress bar')
+    # --- ort training edit
+    parser.add_argument('--use_ort_trainer',
+                        default=False,
+                        action='store_true',
+                        help="Whether to run with ort in fully optimized mode (run optimization in ort as opposed in pytorch).")
+    # ---
     args = parser.parse_args()
     
     return args
@@ -263,7 +273,11 @@ def setup_training(args):
 
     assert (torch.cuda.is_available())
 
-    if args.local_rank == -1:
+    # --- ort training edit
+    if args.use_ort_trainer:
+        ort_supplement.setup_onnxruntime_with_mpi()
+    # ---
+    elif args.local_rank == -1:
         device = torch.device("cuda")
         args.n_gpu = torch.cuda.device_count()
     else:
@@ -316,6 +330,11 @@ def prepare_model_and_optimizer(args, device):
     modeling.ACT2FN["bias_gelu"] = torch.jit.script(modeling.ACT2FN["bias_gelu"])
     model = modeling.BertForPreTraining(config)
 
+    # --- ort training edit
+    if args.use_ort_trainer:
+        model = ort_supplement.create_ort_trainer(args, device, model)
+    # ---
+
     checkpoint = None
     if not args.resume_from_checkpoint:
         global_step = 0
@@ -337,6 +356,11 @@ def prepare_model_and_optimizer(args, device):
             global_step -= args.phase1_end_step
         if is_main_process():
             print("resume step from ", args.resume_step)
+
+    # --- ort training edit (note: returns early)
+    if args.use_ort_trainer:
+        return model, None, checkpoint, global_step, None
+    # ---
 
     model.to(device)
     param_optimizer = list(model.named_parameters())
@@ -527,8 +551,10 @@ def main():
             # shared_file_list["0"] = (train_dataloader, data_file)
 
             overflow_buf = None
-            if args.allreduce_post_accumulation:
+            # --- ort training edit
+            if args.allreduce_post_accumulation and not args.use_ort_trainer:
                 overflow_buf = torch.cuda.IntTensor([0])
+            # ---
             
             if len(files) == 1:
                 f_start_id = -1
@@ -550,22 +576,29 @@ def main():
                     training_steps += 1
                     batch = [t.to(device) for t in batch]
                     input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
-                    prediction_scores, seq_relationship_score = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask)
-                    loss = criterion(prediction_scores, seq_relationship_score, masked_lm_labels, next_sentence_labels)
-                    if args.n_gpu > 1:
-                        loss = loss.mean()  # mean() to average on multi-gpu.
 
-                    divisor = args.gradient_accumulation_steps
-                    if args.gradient_accumulation_steps > 1:
-                        if not args.allreduce_post_accumulation:
-                            # this division was merged into predivision
-                            loss = loss / args.gradient_accumulation_steps
-                            divisor = 1.0
-                    if args.fp16:
-                        with amp.scale_loss(loss, optimizer, delay_overflow_check=args.allreduce_post_accumulation) as scaled_loss:
-                            scaled_loss.backward()
-                    else:
-                        loss.backward()
+                    # --- ort training edit
+                    if args.use_ort_trainer:
+                        ort_supplement.run_ort_training_step(args, batch)
+                    # ----
+                    elif:
+                        prediction_scores, seq_relationship_score = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask)
+                        loss = criterion(prediction_scores, seq_relationship_score, masked_lm_labels, next_sentence_labels)
+                        if args.n_gpu > 1:
+                            loss = loss.mean()  # mean() to average on multi-gpu.
+
+                        divisor = args.gradient_accumulation_steps
+                        if args.gradient_accumulation_steps > 1:
+                            if not args.allreduce_post_accumulation:
+                                # this division was merged into predivision
+                                loss = loss / args.gradient_accumulation_steps
+                                divisor = 1.0
+                        if args.fp16:
+                            with amp.scale_loss(loss, optimizer, delay_overflow_check=args.allreduce_post_accumulation) as scaled_loss:
+                                scaled_loss.backward()
+                        else:
+                            loss.backward()
+
                     average_loss += loss.item()
 
                     if training_steps % args.gradient_accumulation_steps == 0:
@@ -603,10 +636,14 @@ def main():
                             else:
                                 output_save_file = os.path.join(args.output_dir, "ckpt_{}.pt".format(global_step + args.phase1_end_step))
                             if args.do_train:
-                                torch.save({'model': model_to_save.state_dict(),
-                                            'optimizer': optimizer.state_dict(),
-                                            'master params': list(amp.master_params(optimizer)),
-                                            'files': [f_id] + files}, output_save_file)
+                                state = {'model': model_to_save.state_dict(),
+                                         'files': [f_id] + files}
+                                # --- ort training edit
+                                if not args.use_ort_trainer:
+                                    state['optimizer'] = optimizer.state_dict()
+                                    state['master params'] = list(amp.master_params(optimizer))
+                                # ---
+                                torch.save(state, output_save_file)
 
                                 most_recent_ckpts_paths.append(output_save_file)
                                 if len(most_recent_ckpts_paths) > 3:
@@ -614,6 +651,11 @@ def main():
                                     os.remove(ckpt_to_be_removed)
 
                         if global_step >= args.max_steps:
+                            # --- ort training edit
+                            if is_main_process(args) and args.use_ort_trainer:
+                                print('-----------------------save final onnx model-----------------------')
+                                model_to_save.save_as_onnx('{}/final_bert.onnx'.format(args.output_dir))
+                            # ---
                             del train_dataloader
                             # thread.join()
                             return args, final_loss, train_time_raw
