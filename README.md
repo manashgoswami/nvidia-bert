@@ -1,6 +1,6 @@
 # BERT For PyTorch
  
-This repository provides a script and recipe to train the BERT model for PyTorch to achieve state-of-the-art accuracy, and is tested and maintained by NVIDIA.
+This repository provides a script and recipe to train the BERT model for PyTorch to achieve state-of-the-art accuracy, and is tested and maintained by NVIDIA. *This example contains modifications by Microsoft to use the onnxruntime as the training backend to PyTorch. Performance numbers are from original NVIDIA repository and do NOT reflect use of onnxruntime.*
  
 ## Table Of Contents
  

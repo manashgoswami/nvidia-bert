@@ -60,7 +60,8 @@ torch._C._jit_set_profiling_executor(False)
 skipped_steps = 0
 
 # --- ort training edit
-import ort.ort_supplement as ort_supplement
+import onnx
+import ort_supplement.ort_supplement as ort_supplement
 # ---
 
 #Workaround because python functions are not picklable
@@ -122,6 +123,20 @@ class BertPretrainingCriterion(torch.nn.Module):
         total_loss = masked_lm_loss + next_sentence_loss
         return total_loss
 
+# --- ort training edit
+# we manually add the loss function into the bert model
+# currently ort front end support for this assumes a single tensor input for labels
+class bert_model_with_loss(torch.nn.Module):
+    def __init__(self, model, loss_fn):
+        super(bert_model_with_loss, self).__init__()
+        self.model_ = model
+        self.loss_fn_ = loss_fn
+
+    def forward(self, *inputs):
+        input, labels = inputs[:-2], inputs[-2:]
+        preds = self.model_(*input)
+        return self.loss_fn_(*preds, *labels), preds
+# ---
 
 def parse_arguments():
 
@@ -264,6 +279,9 @@ def parse_arguments():
                         default=False,
                         action='store_true',
                         help="Whether to run with ort in fully optimized mode (run optimization in ort as opposed in pytorch).")
+    parser.add_argument('--schedule',
+                        default='warmup_poly',
+                        type=str)
     # ---
     args = parser.parse_args()
     
@@ -275,7 +293,7 @@ def setup_training(args):
 
     # --- ort training edit
     if args.use_ort_trainer:
-        ort_supplement.setup_onnxruntime_with_mpi()
+        device = ort_supplement.setup_onnxruntime_with_mpi(args)
     # ---
     elif args.local_rank == -1:
         device = torch.device("cuda")
@@ -327,11 +345,18 @@ def prepare_model_and_optimizer(args, device):
     if config.vocab_size % 8 != 0:
         config.vocab_size += 8 - (config.vocab_size % 8)
 
-    modeling.ACT2FN["bias_gelu"] = torch.jit.script(modeling.ACT2FN["bias_gelu"])
+    # --- ort training edit
+    if not args.use_ort_trainer:
+        modeling.ACT2FN["bias_gelu"] = torch.jit.script(modeling.ACT2FN["bias_gelu"])
+    # ---
+
     model = modeling.BertForPreTraining(config)
+    criterion = BertPretrainingCriterion(config.vocab_size)
 
     # --- ort training edit
     if args.use_ort_trainer:
+        model.enable_apex(False)
+        model = bert_model_with_loss(model, criterion)
         model = ort_supplement.create_ort_trainer(args, device, model)
     # ---
 
@@ -359,7 +384,7 @@ def prepare_model_and_optimizer(args, device):
 
     # --- ort training edit (note: returns early)
     if args.use_ort_trainer:
-        return model, None, checkpoint, global_step, None
+        return model, None, None, checkpoint, global_step, None
     # ---
 
     model.to(device)
@@ -413,8 +438,6 @@ def prepare_model_and_optimizer(args, device):
             flat_dist_call([param.data for param in model.parameters()], torch.distributed.broadcast, (0,) )
     elif args.n_gpu > 1:
         model = torch.nn.DataParallel(model)
-
-    criterion = BertPretrainingCriterion(config.vocab_size)
 
     return model, optimizer, lr_scheduler, checkpoint, global_step, criterion
 
@@ -480,6 +503,9 @@ def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
 
 def main():
 
+    # --- sukha edit
+    already_saved_onnx_model = False
+    # ---
     args = parse_arguments()
 
     if args.use_env and 'LOCAL_RANK' in os.environ:
@@ -534,11 +560,32 @@ def main():
 
             shared_file_list = {}
 
-            if torch.distributed.is_initialized() and torch.distributed.get_world_size() > num_files:
-                remainder = torch.distributed.get_world_size() % num_files
-                data_file = files[(f_start_id*torch.distributed.get_world_size()+torch.distributed.get_rank() + remainder*f_start_id)%num_files]
+            # --- ort training edit
+
+            # if torch.distributed.is_initialized() and torch.distributed.get_world_size() > num_files:
+            #     remainder = torch.distributed.get_world_size() % num_files
+            #     data_file = files[(f_start_id*torch.distributed.get_world_size()+torch.distributed.get_rank() + remainder*f_start_id)%num_files]
+            # else:
+            #     data_file = files[(f_start_id*torch.distributed.get_world_size()+torch.distributed.get_rank())%num_files]
+
+            if torch.distributed.is_initialized():
+                world_size = torch.distributed.get_world_size()
+                world_rank = torch.distributed.get_rank()
+            elif hasattr(args, 'world_size'):
+                world_size = args.world_size
+                world_rank = args.world_rank
             else:
-                data_file = files[(f_start_id*torch.distributed.get_world_size()+torch.distributed.get_rank())%num_files]
+                world_size = 1
+                world_rank = 0
+
+            if world_size > num_files:
+                remainder = world_size % num_files
+                data_file = files[(f_start_id*world_size + world_rank + remainder*f_start_id)%num_files]
+            elif world_size > 1:
+                data_file = files[(f_start_id*world_size + world_rank)%num_files]
+            else:
+                data_file = files[f_start_id % num_files]
+            # ---
 
             previous_file = data_file
 
@@ -560,11 +607,19 @@ def main():
                 f_start_id = -1
             for f_id in range(f_start_id + 1 , len(files)):
                 
-   
-                if torch.distributed.get_world_size() > num_files:
-                    data_file = files[(f_id*torch.distributed.get_world_size()+torch.distributed.get_rank() + remainder*f_id)%num_files]
+                # --- ort training edit
+                # if torch.distributed.get_world_size() > num_files:
+                #     data_file = files[(f_id*torch.distributed.get_world_size()+torch.distributed.get_rank() + remainder*f_id)%num_files]
+                # else:
+                #     data_file = files[(f_id*torch.distributed.get_world_size()+torch.distributed.get_rank())%num_files]
+
+                if world_size > num_files:
+                    data_file = files[(f_id*world_size+world_rank + remainder*f_id)%num_files]
+                elif world_size > 1:
+                    data_file = files[(f_id*world_size + world_rank)%num_files]
                 else:
-                    data_file = files[(f_id*torch.distributed.get_world_size()+torch.distributed.get_rank())%num_files]
+                    data_file = files[f_id%num_files]
+                # ---
 
                 previous_file = data_file
 
@@ -576,18 +631,18 @@ def main():
                     training_steps += 1
                     batch = [t.to(device) for t in batch]
                     input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
+                    divisor = args.gradient_accumulation_steps
 
                     # --- ort training edit
                     if args.use_ort_trainer:
-                        ort_supplement.run_ort_training_step(args, batch)
+                        loss = ort_supplement.run_ort_training_step(args, global_step, training_steps, model, batch)
                     # ----
-                    elif:
+                    else:
                         prediction_scores, seq_relationship_score = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask)
                         loss = criterion(prediction_scores, seq_relationship_score, masked_lm_labels, next_sentence_labels)
                         if args.n_gpu > 1:
                             loss = loss.mean()  # mean() to average on multi-gpu.
 
-                        divisor = args.gradient_accumulation_steps
                         if args.gradient_accumulation_steps > 1:
                             if not args.allreduce_post_accumulation:
                                 # this division was merged into predivision
@@ -601,9 +656,12 @@ def main():
 
                     average_loss += loss.item()
 
-                    if training_steps % args.gradient_accumulation_steps == 0:
-                        lr_scheduler.step()  # learning rate warmup
-                        global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step)
+                    # --- ort training edit
+                    if not args.use_ort_trainer:
+                    # ---
+                        if training_steps % args.gradient_accumulation_steps == 0:
+                            lr_scheduler.step()  # learning rate warmup
+                            global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step)
 
                     if global_step >= args.max_steps:
                         train_time_raw = time.time() - raw_train_start
@@ -619,9 +677,13 @@ def main():
                             dllogger.log(step=(epoch, global_step, ), data={"final_loss": final_loss})
                     elif training_steps % (args.log_freq * args.gradient_accumulation_steps) == 0:
                         if is_main_process():
-                            dllogger.log(step=(epoch, global_step, ), data={"average_loss": average_loss / (args.log_freq * divisor),
-                                                                            "step_loss": loss.item() * args.gradient_accumulation_steps / divisor,
-                                                                            "learning_rate": optimizer.param_groups[0]['lr']})
+                            data = {"average_loss": average_loss / (args.log_freq * divisor),
+                                    "step_loss": loss.item() * args.gradient_accumulation_steps / divisor}
+                            # --- ort training edit
+                            if not args.use_ort_trainer:
+                                data["learning_rate"] = optimizer.param_groups[0]['lr']
+                            # ---
+                            dllogger.log(step=(epoch, global_step, ), data=data)
                         average_loss = 0
 
                     if global_step >= args.max_steps or training_steps % (
@@ -652,7 +714,7 @@ def main():
 
                         if global_step >= args.max_steps:
                             # --- ort training edit
-                            if is_main_process(args) and args.use_ort_trainer:
+                            if is_main_process() and args.use_ort_trainer:
                                 print('-----------------------save final onnx model-----------------------')
                                 model_to_save.save_as_onnx('{}/final_bert.onnx'.format(args.output_dir))
                             # ---

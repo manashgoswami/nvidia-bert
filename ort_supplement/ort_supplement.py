@@ -1,8 +1,9 @@
-import onnxruntime as ort
+import onnx
 from onnxruntime.capi.ort_trainer import ORTTrainer, IODescription, ModelDescription
 from onnxruntime.capi.ort_trainer import LossScaler
+import torch
 
-def setup_onnxruntime_with_mpi():
+def setup_onnxruntime_with_mpi(args):
     from mpi4py import MPI
     comm = MPI.COMM_WORLD
     args.local_rank = comm.Get_rank()
@@ -15,6 +16,8 @@ def setup_onnxruntime_with_mpi():
     from onnxruntime.capi._pybind_state import set_cuda_device_id 
     set_cuda_device_id(args.local_rank)
 
+    return device
+
 def bert_model_description():
     vocab_size = 30528
     input_ids_desc = IODescription('input_ids', ['batch', 'max_seq_len_in_batch'], torch.int64, num_classes = vocab_size)
@@ -25,11 +28,26 @@ def bert_model_description():
     loss_desc = IODescription('loss', [], torch.float32)
     return ModelDescription([input_ids_desc, segment_ids_desc, input_mask_desc, masked_lm_labels_desc, next_sentence_labels_desc], [loss_desc])
 
-from onnx_transforms.model_transform import add_name, fix_transpose, add_expand_shape
-from onnx_transforms.layer_norm_transform import layer_norm_transform
+# opset 12
+# from ort_supplement.onnx_transforms.model_transform import add_name, fix_transpose, add_expand_shape, process_concat, process_dropout #, handle_expand_input_is_not_constant_case, fix_dim, fix_expand
+
+# opset 10
+from ort_supplement.onnx_transforms.model_transform import add_name, fix_transpose, add_expand_shape, process_concat, process_dropout, handle_expand_input_is_not_constant_case, fix_dim, fix_expand
+
+from ort_supplement.onnx_transforms.layer_norm_transform import layer_norm_transform
 
 def postprocess_model(model):
     add_name(model)
+
+    process_concat(model)
+
+    # opset 10:
+    handle_expand_input_is_not_constant_case(model)
+    fix_expand(model)
+    fix_dim(model)
+    process_dropout(model)
+    # --- 
+
     fix_transpose(model)
     add_expand_shape(model)
     layer_norm_transform(model)
@@ -63,11 +81,11 @@ def create_ort_trainer(args, device, model):
         world_rank=args.local_rank, world_size=args.world_size,
         use_mixed_precision = True if args.fp16 else False,
         allreduce_post_accumulation = True if args.allreduce_post_accumulation else False,
-        _opset_version = 12)
+        _opset_version = 10)
 
     return model
 
-from lr_schedules import SCHEDULES
+from ort_supplement.lr_schedules import SCHEDULES
 def get_lr(args, training_steps, schedule='warmup_poly'):
     if args.max_steps == -1:
         return args.learning_rate
@@ -75,7 +93,7 @@ def get_lr(args, training_steps, schedule='warmup_poly'):
     schedule_fct = SCHEDULES[schedule]
     return args.learning_rate * schedule_fct(training_steps / args.max_steps, args.warmup_proportion)
 
-def run_ort_training_step(args, batch):
+def run_ort_training_step(args, global_step, training_steps, model, batch):
     input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
 
     if args.fp16:
@@ -95,12 +113,6 @@ def run_ort_training_step(args, batch):
     if training_steps % args.gradient_accumulation_steps == 0:
         if args.fp16:
             loss_scaler.update_loss_scale(all_finite.item())
-        if is_main_process(args):
-            writer.add_scalar('train/summary/scalar/Learning_Rate', lr, 
-                global_step + args.phase1_end_step if args.resume_step >= 0 and args.phase2 else global_step)
-            if args.fp16:
-                writer.add_scalar('train/summary/scalar/loss_scale_25', loss_scale, 
-                    global_step + args.phase1_end_step if args.resume_step >= 0 and args.phase2 else global_step)
-                writer.add_scalar('train/summary/scalar/all_fp16_gradients_finite_859', all_finite, 
-                    global_step + args.phase1_end_step if args.resume_step >= 0 and args.phase2 else global_step)
         global_step += 1
+
+    return loss
