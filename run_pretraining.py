@@ -61,7 +61,6 @@ skipped_steps = 0
 
 # --- ort training edit
 import onnx
-import ort_supplement.ort_supplement as ort_supplement
 # ---
 
 #Workaround because python functions are not picklable
@@ -293,6 +292,8 @@ def setup_training(args):
 
     # --- ort training edit
     if args.use_ort_trainer:
+        global ort_supplement
+        import ort_supplement.ort_supplement as ort_supplement
         device = ort_supplement.setup_onnxruntime_with_mpi(args)
     # ---
     elif args.local_rank == -1:
