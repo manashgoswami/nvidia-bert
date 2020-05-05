@@ -26,7 +26,7 @@ RUN wget --quiet https://github.com/Kitware/CMake/releases/download/v3.14.3/cmak
 
 RUN git clone https://github.com/microsoft/onnxruntime.git &&\
     cd /src/onnxruntime &&\
-    git checkout 6f95cdfa68d5d950f342f4f8ee83930cfbff8d67 &&\
+    git checkout orttraining_rc1 &&\
     /bin/sh ./build.sh \
         --config RelWithDebInfo \
         --use_cuda \
